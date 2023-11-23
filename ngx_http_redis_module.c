@@ -24,6 +24,7 @@ typedef struct {
     ngx_int_t                  db;
     ngx_int_t                  auth;
     ngx_uint_t                 gzip_flag;
+    ngx_http_complex_value_t  *complex_target; /* for redis_pass */
 } ngx_http_redis_loc_conf_t;
 
 
@@ -50,6 +51,8 @@ static char *ngx_http_redis_merge_loc_conf(ngx_conf_t *cf,
 
 static char *ngx_http_redis_pass(ngx_conf_t *cf, ngx_command_t *cmd,
     void *conf);
+static ngx_http_upstream_srv_conf_t *
+    ngx_http_redis_upstream_add(ngx_http_request_t *r, ngx_url_t *url);
 
 static ngx_conf_bitmask_t  ngx_http_redis_next_upstream_masks[] = {
     { ngx_string("error"), NGX_HTTP_UPSTREAM_FT_ERROR },
@@ -209,6 +212,40 @@ ngx_http_redis_handler(ngx_http_request_t *r)
 
     if (ngx_http_upstream_create(r) != NGX_OK) {
         return NGX_HTTP_INTERNAL_SERVER_ERROR;
+    }
+
+    rlcf = ngx_http_get_module_loc_conf(r, ngx_http_redis_module);
+    if (rlcf->complex_target) {
+        ngx_str_t           target;
+        ngx_url_t           url;
+
+        /* variables used in the redis_pass directive */
+
+        if (ngx_http_complex_value(r, rlcf->complex_target, &target)
+                != NGX_OK)
+        {
+            return NGX_ERROR;
+        }
+
+        if (target.len == 0) {
+            ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+                    "handler: empty \"redis_pass\" target");
+            return NGX_HTTP_INTERNAL_SERVER_ERROR;
+        }
+
+        url.host = target;
+        url.port = 0;
+        url.default_port = 6379;
+        url.no_resolve = 1;
+
+        rlcf->upstream.upstream = ngx_http_redis_upstream_add(r, &url);
+
+        if (rlcf->upstream.upstream == NULL) {
+            ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+                   "redis: upstream \"%V\" not found", &target);
+
+            return NGX_HTTP_INTERNAL_SERVER_ERROR;
+        }
     }
 
     u = r->upstream;
@@ -850,20 +887,11 @@ ngx_http_redis_pass(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
     ngx_url_t                  u;
     ngx_http_core_loc_conf_t  *clcf;
 
+    ngx_int_t                           n;
+    ngx_http_compile_complex_value_t    ccv;
+
     if (rlcf->upstream.upstream) {
         return "is duplicate";
-    }
-
-    value = cf->args->elts;
-
-    ngx_memzero(&u, sizeof(ngx_url_t));
-
-    u.url = value[1];
-    u.no_resolve = 1;
-
-    rlcf->upstream.upstream = ngx_http_upstream_add(cf, &u, 0);
-    if (rlcf->upstream.upstream == NULL) {
-        return NGX_CONF_ERROR;
     }
 
     clcf = ngx_http_conf_get_module_loc_conf(cf, ngx_http_core_module);
@@ -883,7 +911,80 @@ ngx_http_redis_pass(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
     rlcf->db = ngx_http_get_variable_index(cf, &ngx_http_redis_db);
     rlcf->auth = ngx_http_get_variable_index(cf, &ngx_http_redis_auth);
 
+    value = cf->args->elts;
+
+    n = ngx_http_script_variables_count(&value[1]);
+    if (n) {
+        rlcf->complex_target = ngx_palloc(cf->pool,
+                                          sizeof(ngx_http_complex_value_t));
+
+        if (rlcf->complex_target == NULL) {
+            return NGX_CONF_ERROR;
+        }
+
+        ngx_memzero(&ccv, sizeof(ngx_http_compile_complex_value_t));
+        ccv.cf = cf;
+        ccv.value = &value[1];
+        ccv.complex_value = rlcf->complex_target;
+
+        if (ngx_http_compile_complex_value(&ccv) != NGX_OK) {
+            return NGX_CONF_ERROR;
+        }
+
+        return NGX_CONF_OK;
+    }
+
+    rlcf->complex_target = NULL;
+
+    ngx_memzero(&u, sizeof(ngx_url_t));
+
+    u.url = value[1];
+    u.no_resolve = 1;
+
+    rlcf->upstream.upstream = ngx_http_upstream_add(cf, &u, 0);
+    if (rlcf->upstream.upstream == NULL) {
+        return NGX_CONF_ERROR;
+    }
+
     return NGX_CONF_OK;
+}
+
+
+static ngx_http_upstream_srv_conf_t *
+ngx_http_redis_upstream_add(ngx_http_request_t *r, ngx_url_t *url)
+{
+    ngx_http_upstream_main_conf_t  *umcf;
+    ngx_http_upstream_srv_conf_t  **uscfp;
+    ngx_uint_t                      i;
+
+    umcf = ngx_http_get_module_main_conf(r, ngx_http_upstream_module);
+
+    uscfp = umcf->upstreams.elts;
+
+    for (i = 0; i < umcf->upstreams.nelts; i++) {
+
+        if (uscfp[i]->host.len != url->host.len
+            || ngx_strncasecmp(uscfp[i]->host.data, url->host.data,
+               url->host.len) != 0)
+        {
+            continue;
+        }
+
+        if (uscfp[i]->port != url->port) {
+            continue;
+        }
+
+        if (uscfp[i]->default_port
+            && url->default_port
+            && uscfp[i]->default_port != url->default_port)
+        {
+            continue;
+        }
+
+        return uscfp[i];
+    }
+
+    return NULL;
 }
 
 
