@@ -592,7 +592,9 @@ found:
              * with ngx_http_gunzip_filter module
              */
             h->hash = 1;
+#if (nginx_version > 1021006)
             h->next = NULL;
+#endif
             ngx_str_set(&h->key, "Content-Encoding");
             ngx_str_set(&h->value, "gzip");
             r->headers_out.content_encoding = h;
